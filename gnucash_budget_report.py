@@ -11,6 +11,8 @@ import argparse
 import sys
 import os
 import time
+import gzip
+import functools
 import datetime
 import tempfile
 from xml.dom import minidom
@@ -20,74 +22,176 @@ logging.basicConfig(level=0)
 logger = logging.getLogger(__name__)
 logger.setLevel(0)
 
-try:
-    logger.warning("Importing gnucash bindings.")
-    logger.warning("Messages may be ignored until further notice.")
-    import gnucash
-except Exception as e:
-    error = e
-else:
-    error = None
-finally:
-    logger.warning("Messages must now be heeded.")
-    if error:
-        if __name__ == "__main__":
-            logger.fatal("Cannot import gnucash Python bindings.")
-            exit(1)
+def gncvalue_to_float(string):
+    num,denom = map(float,string.split('/'))
+    if denom < 0:
+        value = num * (-denom)
+    else:
+        value = num / denom
+    return value
+
+class GnucashTransaction(object):
+    def __init__(self,xmldom):
+        self._xmldom = xmldom
+    @property
+    def timestamp(self):
+        posted = self._xmldom.getElementsByTagName('trn:date-posted')[0]
+        raw = posted.getElementsByTagName('ts:date')[0].firstChild.nodeValue
+        date = raw[:-6]
+        offset = int(raw[-5:]) / 100
+        timestamp = datetime.datetime.strptime(date,'%Y-%m-%d %H:%M:%S')
+        # ignoring UTC offset for now
+        #timestamp -= offset * 60
+        return timestamp
+    @property
+    def splits(self):
+        splits = self._xmldom.getElementsByTagName('trn:splits')[0].getElementsByTagName('trn:split')
+        accounts = [i.getElementsByTagName('split:account')[0].firstChild.nodeValue for i in splits]
+        values = [i.getElementsByTagName('split:value')[0].firstChild.nodeValue for i in splits]
+        values = map(gncvalue_to_float,values)
+        return zip(accounts,values)
+
+class GnucashAccount(object):
+    _parent = None
+    _book = None
+    def __init__(self,xmldom,parent=None):
+        self._xmldom = xmldom
+        if parent:
+            self.set_parent(parent)
+        self.children = set()
+    @property
+    def guid(self):
+        me = self._xmldom.getElementsByTagName('act:id')[0].firstChild.nodeValue
+        return me
+    def __hash__(self):
+        return int('0x'+self.guid,0)
+    def _get_parent_guid(self):
+        tags = self._xmldom.getElementsByTagName('act:parent')
+        if tags:
+            return tags[0].firstChild.nodeValue
         else:
-            raise error
+            return None
+    @property
+    def name(self):
+        return self._xmldom.getElementsByTagName('act:name')[0].firstChild.nodeValue
+    @property
+    def parent(self):
+        return self._parent
+    def set_parent(self,parent):
+        if parent and self.parent and not parent == self.parent:
+            raise Exception('Parent already set!')
+        self._parent = parent
+        parent.children.add(self)
 
-class GnucashSession(gnucash.Session):
-    """Gnucash Session extended for us of with statement"""
-    def __enter__(self):
-        return self
-    def __exit__(self, exc_t, exc_v, trace):
-        self.destroy()
 
-def get_budgets(input, year, month):
-    tmpname = None
-    with tempfile.NamedTemporaryFile(delete=False) as t:
-        tmpname = t.name
-        flag = False
-        while True:
-            line = input.readline()
-            if not line:
-                break
-            if 'gnc:budget' in line:
-                flag = not '/gnc:budget' in line
-            if (flag or line.startswith('<?xml')
-                     or 'gnc-v2' in line
-                     or 'xmlns' in line
-                     or '/gnc:budget' in line):
-                t.write(line)
-    logger.info('start parse xml')
-    xmldoc = minidom.parse(tmpname)
-    logger.info('end parse xml')
-    budget_start_date = xmldoc.getElementsByTagName('gdate')[0].firstChild.data
-    budget_start_date = string_to_date(budget_start_date)
-    request_date = ymd_tuple_to_date((year,month,1))
-    slot_number = int((request_date - budget_start_date).days * 12/365.25)
-    slots = xmldoc.getElementsByTagName('slot')
-    guids = [s.getElementsByTagName('slot:key')[0].firstChild.data for s in slots]
-    budget = []
-    for s in slots:
-        sub_slots = s.getElementsByTagName('slot')
-        keys = [ss.getElementsByTagName('slot:key')[0].firstChild.data for ss in sub_slots]
-        keys = map(int,keys)
+
+class GnucashBookIOError(IOError):pass
+class GnucashBookParseError(Exception):pass
+class GnucashBook(object):
+    filename = None
+    _xmldom = None
+    def __init__(self,filename):
+        logging.debug('Checking for {:s}'.format(filename))
+        if not os.path.exists(filename):
+            raise GnucashBookIOError('No such file "{:s}"'.format(filename))
+        self.filename = filename
+        self._load()
+        
+    @property
+    def is_compressed(self):
+        f = gzip.GzipFile(self.filename)
         try:
-            index = keys.index(slot_number)
-        except ValueError:
-            value = 0.0
+            f.readline()
+        except:
+            compressed = False
         else:
-            value = sub_slots[index].getElementsByTagName('slot:value')[0].firstChild.data
-            num,denom = map(float,value.split('/'))
-            if denom < 0:
-                value = num * (-denom)
+            compressed = True
+        f.close()
+        return compressed
+    
+    def get_transactions(self):
+        try:
+            return self._transactions
+        except AttributeError:
+            txs = self._xmldom.getElementsByTagName('gnc:transaction')
+            txs =  map(GnucashTransaction,txs)
+            self._transactions = txs
+            return txs
+
+
+    def _load(self):
+        if self.is_compressed:
+            f = gzip.GzipFile(self.filename)
+        else:
+            f = open(self.filename)
+        try:
+            logger.info('start parse xml')
+            self._xmldom = minidom.parse(f)
+            logger.info('end parse xml')
+        except Exception as e:
+            raise GnucashBookParseError(*e.args)
+        finally:
+            f.close()
+    def get_root_account(self):
+        accounts = {}
+        xml_accounts = self._xmldom.getElementsByTagName('gnc:account')
+        all_accounts = map(GnucashAccount,xml_accounts)
+        for a in all_accounts:
+            def temp(**kwargs):
+                return self.get_account_balance(a.guid,**kwargs)
+            a.get_balance = temp
+        guid = [i.guid for i in all_accounts]
+        accounts = dict(zip(guid,all_accounts))
+        root = all_accounts.pop(0)
+        for a in all_accounts:
+            parent = a._get_parent_guid()
+            if parent:
+                a.set_parent(accounts[a._get_parent_guid()])
+        return root
+    def get_account_monthly_balance(self,guid,year,month):
+        return self.get_account_balance(guid,
+                                        start = datetime.datetime(year,month,1,0,0),
+                                        end = datetime.datetime(year,month+1,1,0,0) + datetime.timedelta(-1e-3))
+    def get_account_balance(self,guid,start=datetime.datetime(1,1,1),end=datetime.datetime(9999,1,1)):
+        balance = 0
+        for tx in self.get_transactions():
+            if not (tx.timestamp >= start and tx.timestamp <= end):
+                continue
+            splits = tx.splits
+            for id,value in splits:
+                if id == guid:
+                    balance += value
+        return balance
+
+
+    def _get_budgets(self, year, month):
+        xmldom = self._xmldom.getElementsByTagName('gnc:budget')[0]
+        assert xmldom.getAttribute('version') == u'2.0.0'
+        budget_start_date = xmldom.getElementsByTagName('gdate')[0].firstChild.data
+        budget_start_date = string_to_date(budget_start_date)
+        request_date = ymd_tuple_to_date((year,month,1))
+        slot_number = int((request_date - budget_start_date).days * 12/365.25)
+        slots = xmldom.getElementsByTagName('slot')
+        guids = [s.getElementsByTagName('slot:key')[0].firstChild.data for s in slots]
+        budget = []
+        for s in slots:
+            sub_slots = s.getElementsByTagName('slot')
+            keys = [ss.getElementsByTagName('slot:key')[0].firstChild.data for ss in sub_slots]
+            keys = map(int,keys)
+            try:
+                index = keys.index(slot_number)
+            except ValueError:
+                value = 0.0
             else:
-                value = num / denom
-        budget.append(value)
-    budget = dict(zip(guids,budget))
-    return budget
+                value = sub_slots[index].getElementsByTagName('slot:value')[0].firstChild.data
+                num,denom = map(float,value.split('/'))
+                if denom < 0:
+                    value = num * (-denom)
+                else:
+                    value = num / denom
+            budget.append(value)
+        budget = dict(zip(guids,budget))
+        return budget
 
 
 def ymd_tuple_to_date(t):
@@ -96,24 +200,20 @@ def string_to_date(string):
     return datetime.datetime.strptime(string,'%Y-%m-%d')
 
 def get_balances(account, starttime=None, endtime=None):
-    if not endtime:
-        endtime = datetime.datetime.now()
-    if not starttime:
-        starttime = endtime - datetime.timedelta(endtime.day - 0.5)
-    name = account.GetName()
-    start_tuple = time.mktime(starttime.timetuple())
-    end_tuple = time.mktime(endtime.timetuple())
-    start_balance = account.GetBalanceAsOfDate(start_tuple).to_double()
-    end_balance = account.GetBalanceAsOfDate(end_tuple).to_double()
-    balance = end_balance - start_balance
-    guid = account.GetGUID().to_string()
+    logging.debug('getting balance for {:s}'.format(account.guid))
+    args = {}
+    if starttime:
+        args['start'] = starttime
+    if endtime:
+        args['end'] = endtime
+    balance = account.get_balance(**args)
     try:
         flex = 'flex' in account.GetNotes()
-    except TypeError:
+    except:
         flex = False
-    children = account.get_children_sorted()
+    children = sorted(account.children)
     child_balance = list(map(lambda i: get_balances(i,starttime,endtime),children))
-    return guid, (name, flex, balance, child_balance)
+    return account.guid, (account.name, flex, balance, child_balance)
 
 
 def get_monthly_balances(account, year, month):
@@ -148,7 +248,7 @@ def main(input,output,
     filename = gnucash file path
     """
     root = get_root_account(input,output,year,month)
-    basename = os.path.splitext(os.path.split(input.name)[-1])[0]
+    basename = os.path.splitext(os.path.split(input)[-1])[0]
     output.write('<?xml version="1.0"?>\n')
     output.write('<?xml-stylesheet type="text/xsl" href="{:s}.xsl"?>\n'.format(basename))
     ET = xml.etree.ElementTree
@@ -158,27 +258,10 @@ def main(input,output,
 
 
 def get_root_account(input,output,year,month):
-    budgets = get_budgets(input,year,month)
-    try:
-        with GnucashSession(input.name) as session:
-            root_account = session.get_book().get_root_account()
-            balances = get_monthly_balances(root_account, year, month)
-    except gnucash.gnucash_core.GnuCashBackendException:
-        try:
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            with open(input.name) as f:
-                tmp.write(f.read())
-            tmp.close()
-            with GnucashSession(tmp.name) as session:
-                root_account = session.get_book().get_root_account()
-                balances = get_monthly_balances(root_account, year, month)
-        except:
-            fmt = 'Cannot open gnucash file "{:s}".'
-            msg = fmt.format(input.name)
-            logger.fatal(msg)
-            exit(1)
-        finally:
-            os.remove(tmp.name)
+    book = GnucashBook(input)
+    budgets = book._get_budgets(year,month)
+    root = book.get_root_account()
+    balances = get_monthly_balances(root, year, month)
     root = Account()
     root.name = balances[1][0]
     root.guid = balances[0]
@@ -294,14 +377,13 @@ class Account(object):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('INPUT',type=file,help='gnucash file path')
+    parser.add_argument('INPUT',help='gnucash file path')
     parser.add_argument('-o','--output',type=argparse.FileType('w'),default=sys.stdout,help='report output file path')
 
     args = parser.parse_args()
     gnc_file = args.INPUT
     output = args.output
     
-
     main(gnc_file,output)
 
 
