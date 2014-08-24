@@ -30,8 +30,8 @@ def update_report(INPUT,output,force=False):
         print('Report already updated')
 
 def update_script():
-    results = subprocess.call('git pull -f')
-    results = submodule.call('git submodule update')
+    results = os.system('git pull -f')
+    results = os.system('git submodule update')
 
 
 if __name__ == '__main__':
