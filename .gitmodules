@@ -1,0 +1,3 @@
+[submodule "gnucash-python-free"]
+	path = gnucash_free
+	url = git@github.com:tbhartman/gnucash-python-free.git
