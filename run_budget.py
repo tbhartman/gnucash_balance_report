@@ -31,7 +31,7 @@ def update_report(INPUT,output,force=False):
 
 def update_script():
     results = subprocess.call('git pull -f')
-    
+    results = submodule.call('git submodule update')
 
 
 if __name__ == '__main__':
